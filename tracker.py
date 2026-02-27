@@ -204,7 +204,7 @@ Respond with ONLY the JSON array, no markdown, no explanation."""
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",   # free, fast, accurate
+            model="llama-3.3-70b-versatile",   # free, fast, accurate
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=2048,
