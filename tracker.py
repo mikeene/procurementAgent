@@ -1,15 +1,14 @@
 """
-Procurement Intelligence Bot — v5
-Fixed sources based on actual error analysis:
+Procurement Intelligence Bot — v6
 
-  ReliefWeb  — POST with JSON body (not GET with params)
-  World Bank — simplified params (no fl= field filter that caused 500)
-  TED        — correct RSS URL format
-  IMF        — jobs RSS feed (confirmed working)
-  USAID      — procurement RSS (confirmed working)
-  UN Jobs    — RSS feed
+Key insight: Most procurement APIs block GitHub Actions IPs.
+Solution: Use Groq's built-in web_search tool — Groq fetches the web
+on our behalf from their own servers, bypassing all IP blocks.
 
-AI      : Groq / Llama 3.3 (free)
+Groq searches for procurement notices, returns structured results,
+then we filter and email them.
+
+AI      : Groq / Llama 3.3 with web_search tool (free)
 Email   : Gmail SMTP (free)
 Hosting : GitHub Actions (free)
 """
@@ -17,8 +16,6 @@ Hosting : GitHub Actions (free)
 import os
 import json
 import smtplib
-import xml.etree.ElementTree as ET
-import requests
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -29,377 +26,118 @@ EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
 EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
 EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
 
-HEADERS_JSON = {
-    "User-Agent":   "Mozilla/5.0 (compatible; ProcurementBot/5.0)",
-    "Accept":       "application/json",
-    "Content-Type": "application/json",
-}
-HEADERS_XML = {
-    "User-Agent": "Mozilla/5.0 (compatible; ProcurementBot/5.0)",
-    "Accept":     "application/rss+xml, text/xml, */*",
-}
-
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-KEYWORDS = [
-    "digital skills", "digital literacy", "youth training", "youth employment",
-    "skills development", "capacity building", "entrepreneurship",
-    "job matching", "artificial intelligence", "ai training",
-    "workforce development", "upskilling", "reskilling",
-    "edtech", "e-learning", "vocational training", "labor market",
-    "employment", "human capital", "training",
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1: Use Groq web search to find procurement notices
+# Groq fetches from its own servers — not blocked like GitHub Actions IPs
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEARCH_QUERIES = [
+    # AfDB specific
+    'site:afdb.org procurement "digital skills" OR "capacity building" OR "youth employment" 2024 OR 2025',
+    'site:afdb.org procurement "skills development" OR "entrepreneurship" OR "job matching"',
+    # World Bank specific
+    'site:worldbank.org OR site:projects.worldbank.org procurement "digital skills" OR "youth employment" OR "capacity building"',
+    'site:worldbank.org procurement "skills development" OR "entrepreneurship" OR "workforce development"',
+    # IMF specific
+    'site:imf.org procurement OR tender "digital skills" OR "capacity building" OR "training"',
+    # EU TED
+    'site:ted.europa.eu "digital skills" OR "capacity building" OR "youth employment" tender 2024 OR 2025',
+    # UNDP / UN
+    'site:undp.org procurement "digital skills" OR "capacity building" OR "youth employment" tender',
+    'procurement tender "digital skills training" Africa 2025',
+    'RFP "capacity building" "youth employment" Africa multilateral 2025',
+    'tender "job matching platform" OR "skills development" Africa development bank 2025',
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER: Parse RSS/Atom feed
-# ─────────────────────────────────────────────────────────────────────────────
+def search_for_notices() -> list[dict]:
+    """Use Groq web search tool to find procurement notices."""
+    all_notices = []
+    seen_titles = set()
 
-def parse_rss(url: str, source_name: str, timeout: int = 20) -> list[dict]:
-    notices = []
-    try:
-        resp = requests.get(url, headers=HEADERS_XML, timeout=timeout)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
+    print(f"  Running {len(SEARCH_QUERIES)} web searches via Groq…")
 
-        # Standard RSS <item>
-        for item in root.findall(".//item"):
-            title   = (item.findtext("title") or "").strip()
-            link    = (item.findtext("link") or "").strip()
-            desc    = (item.findtext("description") or "").strip()[:300]
-            pubdate = (item.findtext("pubDate") or "").strip()[:16]
-            if title and len(title) > 5:
-                notices.append({
-                    "source":      source_name,
-                    "title":       title,
-                    "description": desc,
-                    "url":         link,
-                    "date":        pubdate,
-                    "country":     "",
-                })
-
-        # Atom <entry>
-        ns = "http://www.w3.org/2005/Atom"
-        for entry in root.findall(f".//{{{ns}}}entry") or root.findall(".//entry"):
-            title   = (entry.findtext(f"{{{ns}}}title") or entry.findtext("title") or "").strip()
-            link_el = entry.find(f"{{{ns}}}link") or entry.find("link")
-            link    = (link_el.get("href", "") if link_el is not None else "")
-            summary = entry.find(f"{{{ns}}}summary") or entry.find("summary")
-            desc    = (summary.text or "").strip()[:300] if summary is not None else ""
-            date    = (entry.findtext(f"{{{ns}}}updated") or entry.findtext("updated") or "")[:10]
-            if title and len(title) > 5:
-                notices.append({
-                    "source":      source_name,
-                    "title":       title,
-                    "description": desc,
-                    "url":         link,
-                    "date":        date,
-                    "country":     "",
-                })
-    except Exception as e:
-        print(f"    [RSS {source_name}] {e}")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 1: ReliefWeb — POST with JSON body (fixes the 403)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_reliefweb() -> list[dict]:
-    notices  = []
-    seen_ids = set()
-    print("  Fetching ReliefWeb…")
-
-    terms = [
-        "digital skills", "capacity building", "youth employment",
-        "skills development", "job matching", "entrepreneurship",
-        "workforce development", "vocational training",
-    ]
-
-    for term in terms:
+    for i, query in enumerate(SEARCH_QUERIES, 1):
+        print(f"    [{i}/{len(SEARCH_QUERIES)}] {query[:80]}…")
         try:
-            # Must use POST with JSON body — GET with query params returns 403
-            resp = requests.post(
-                "https://api.reliefweb.int/v1/jobs?appname=procurementbot",
-                json={
-                    "query": {
-                        "value":  term,
-                        "fields": ["title", "body"],
-                        "operator": "AND",
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a procurement research assistant. "
+                            "When given a search query, search the web and extract procurement notices. "
+                            "Return ONLY a JSON array of results. Each item must have: "
+                            "title, url, source, description, date, country. "
+                            "Only include actual procurement opportunities (tenders, RFPs, contracts, grants). "
+                            "If no relevant results found, return []."
+                        ),
                     },
-                    "fields": {
-                        "include": ["title", "url", "date", "country", "body", "source"]
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Search for: {query}\n\n"
+                            "Return results as a JSON array with fields: "
+                            "title, url, source, description, date, country. "
+                            "Only actual procurement opportunities. Return [] if none found."
+                        ),
                     },
-                    "limit": 20,
-                    "sort": ["date:desc"],
-                },
-                headers=HEADERS_JSON,
-                timeout=20,
+                ],
+                tools=[{"type": "web_search"}],
+                tool_choice="auto",
+                max_tokens=2048,
             )
-            resp.raise_for_status()
-            data = resp.json()
 
-            for item in data.get("data", []):
-                rid = str(item.get("id", ""))
-                if rid in seen_ids:
-                    continue
-                seen_ids.add(rid)
-                f       = item.get("fields", {})
-                title   = f.get("title", "").strip()
-                body    = f.get("body", "")[:300]
-                iurl    = f.get("url", f"https://reliefweb.int/node/{rid}")
-                date_f  = f.get("date", {})
-                date    = date_f.get("created", "")[:10] if isinstance(date_f, dict) else ""
-                country = f.get("country", [{}])[0].get("name", "") if f.get("country") else ""
-                src     = f.get("source", [{}])[0].get("name", "") if f.get("source") else ""
-                if title:
-                    notices.append({
-                        "source":      f"ReliefWeb / {src}" if src else "ReliefWeb",
+            # Extract text from response (may include tool use blocks)
+            full_text = ""
+            for block in response.choices[0].message.content if isinstance(response.choices[0].message.content, list) else []:
+                if hasattr(block, "text"):
+                    full_text += block.text
+            if not full_text:
+                full_text = response.choices[0].message.content or ""
+
+            # Parse JSON from response
+            if "[" in full_text and "]" in full_text:
+                start = full_text.index("[")
+                end   = full_text.rindex("]") + 1
+                json_str = full_text[start:end]
+                results  = json.loads(json_str)
+
+                for item in results:
+                    title = (item.get("title") or "").strip()
+                    if not title or len(title) < 6:
+                        continue
+                    key = title.lower()[:80]
+                    if key in seen_titles:
+                        continue
+                    seen_titles.add(key)
+                    all_notices.append({
+                        "source":      item.get("source", "Web Search"),
                         "title":       title,
-                        "description": body,
-                        "url":         iurl,
-                        "date":        date,
-                        "country":     country,
-                    })
-        except Exception as e:
-            print(f"    [ReliefWeb '{term}'] {e}")
-
-    print(f"    ReliefWeb: {len(notices)} items")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 2: World Bank Projects API — simplified params (fixes the 500)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_world_bank() -> list[dict]:
-    notices  = []
-    seen_ids = set()
-    print("  Fetching World Bank…")
-
-    terms = [
-        "digital skills", "youth employment", "capacity building",
-        "job matching", "entrepreneurship", "vocational training",
-        "workforce", "skills development",
-    ]
-
-    for term in terms:
-        try:
-            # Removed the fl= param that was causing 500 errors
-            resp = requests.get(
-                "https://search.worldbank.org/api/v2/projects",
-                params={
-                    "format": "json",
-                    "rows":   15,
-                    "qterm":  term,
-                    "status": "Active",
-                },
-                headers=HEADERS_JSON,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            for proj in data.get("projects", {}).get("project", []):
-                pid = proj.get("id", "")
-                if not pid or pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-                title   = proj.get("project_name", "").strip()
-                country = proj.get("countryname", "")
-                desc    = proj.get("project_abstract", "")
-                if isinstance(desc, dict):
-                    desc = desc.get("cdata", "") or ""
-                url = f"https://projects.worldbank.org/en/projects-operations/project-detail/{pid}"
-                if title:
-                    notices.append({
-                        "source":      "World Bank",
-                        "title":       title,
-                        "description": str(desc)[:300],
-                        "url":         url,
-                        "date":        proj.get("closingdate", proj.get("boardapprovaldate", ""))[:10],
-                        "country":     country,
-                    })
-        except Exception as e:
-            print(f"    [World Bank '{term}'] {e}")
-
-    print(f"    World Bank: {len(notices)} items")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 3: TED EU Tenders — correct RSS URL (fixes the 404)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_ted() -> list[dict]:
-    notices = []
-    print("  Fetching TED (EU Tenders)…")
-
-    # Correct TED RSS URL format (verified from TED documentation)
-    keywords = [
-        "skills+training",
-        "capacity+building",
-        "youth+employment",
-        "digital+literacy",
-        "entrepreneurship+training",
-        "workforce+development",
-    ]
-
-    for kw in keywords:
-        url = (
-            f"https://ted.europa.eu/TED/search/getFeedURL.do?"
-            f"keyword={kw}&"
-            f"scope=&textScope=td&"
-            f"pubDateFrom=&pubDateTo=&"
-            f"document=&contract=&"
-            f"orderBy=ND&orderByDirection=DESC"
-        )
-        items = parse_rss(url, "TED (EU Tenders)")
-        notices.extend(items)
-
-    print(f"    TED: {len(notices)} items")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 4: USAID Business Forecast & procurement RSS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_usaid() -> list[dict]:
-    notices = []
-    print("  Fetching USAID…")
-
-    rss_urls = [
-        ("https://www.usaid.gov/rss/business/procurement_notices.xml", "USAID"),
-        ("https://www.usaid.gov/rss/business/small_business.xml",      "USAID"),
-    ]
-
-    for url, src in rss_urls:
-        items = parse_rss(url, src)
-        notices.extend(items)
-
-    print(f"    USAID: {len(notices)} items")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 5: IMF Procurement RSS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_imf() -> list[dict]:
-    notices = []
-    print("  Fetching IMF…")
-
-    rss_urls = [
-        ("https://www.imf.org/en/About/Procurement/rss",          "IMF"),
-        ("https://www.imf.org/external/np/adm/rec/job/jobsrss.asp", "IMF"),
-    ]
-
-    for url, src in rss_urls:
-        items = parse_rss(url, src)
-        notices.extend(items)
-
-    print(f"    IMF: {len(notices)} items")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 6: UN Jobs RSS (UNDP, UNICEF, UN Women etc. post procurement here)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_un_jobs() -> list[dict]:
-    notices = []
-    print("  Fetching UN Jobs / UNDP…")
-
-    rss_urls = [
-        ("https://jobs.undp.org/cj_view_jobs.cfm?rss=1",                  "UNDP"),
-        ("https://procurement-notices.undp.org/view_notices.cfm?rss=true", "UNDP Procurement"),
-        ("https://www.unicef.org/supply/rss",                              "UNICEF Supply"),
-    ]
-
-    for url, src in rss_urls:
-        items = parse_rss(url, src)
-        notices.extend(items)
-
-    print(f"    UN Jobs/UNDP: {len(notices)} items")
-    return notices
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 7: AfDB — try their official procurement notice page via API
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_afdb() -> list[dict]:
-    notices = []
-    print("  Fetching AfDB…")
-
-    # AfDB has a procurement search endpoint
-    try:
-        resp = requests.get(
-            "https://www.afdb.org/en/projects-and-operations/procurement",
-            params={"type": "procurement_notice", "format": "json"},
-            headers=HEADERS_JSON,
-            timeout=20,
-        )
-        if resp.status_code == 200 and "application/json" in resp.headers.get("Content-Type", ""):
-            for item in resp.json().get("data", [])[:50]:
-                title = item.get("title", "").strip()
-                url   = item.get("url", "") or item.get("link", "")
-                if title:
-                    notices.append({
-                        "source":      "AfDB",
-                        "title":       title,
-                        "description": item.get("description", "")[:300],
-                        "url":         url,
+                        "description": (item.get("description") or "")[:300],
+                        "url":         item.get("url", ""),
                         "date":        item.get("date", ""),
                         "country":     item.get("country", ""),
                     })
-    except Exception as e:
-        print(f"    [AfDB API] {e}")
 
-    # Try AfDB open data API
-    try:
-        resp = requests.get(
-            "https://projectsportal.afdb.org/dataportal/api/project/search",
-            params={
-                "keywords": "digital skills capacity building youth employment",
-                "status":   "Active",
-                "format":   "json",
-            },
-            headers=HEADERS_JSON,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for proj in (data.get("data") or data.get("projects") or [])[:30]:
-            pid   = proj.get("project_id") or proj.get("id", "")
-            title = proj.get("project_title") or proj.get("title", "")
-            if not title:
-                continue
-            url = (
-                f"https://projectsportal.afdb.org/dataportal/VProject/show/{pid}"
-                if pid else "https://projectsportal.afdb.org"
-            )
-            notices.append({
-                "source":      "AfDB",
-                "title":       title.strip(),
-                "description": proj.get("description", "")[:300],
-                "url":         url,
-                "date":        proj.get("closing_date", proj.get("approval_date", "")),
-                "country":     proj.get("country", ""),
-            })
-    except Exception as e:
-        print(f"    [AfDB projects portal] {e}")
+        except json.JSONDecodeError:
+            pass  # Model returned text instead of JSON — skip
+        except Exception as e:
+            print(f"      [Search error] {e}")
 
-    print(f"    AfDB: {len(notices)} items")
-    return notices
+    print(f"  Found {len(all_notices)} unique notices from web search")
+    return all_notices
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI FILTERING
+# STEP 2: Score and filter with Groq
 # ─────────────────────────────────────────────────────────────────────────────
 
-def filter_with_groq(notices: list[dict]) -> list[dict]:
+def score_notices(notices: list[dict]) -> list[dict]:
+    """Score already-filtered notices for relevance and quality."""
     if not notices:
         return []
 
@@ -414,39 +152,37 @@ def filter_with_groq(notices: list[dict]) -> list[dict]:
     ]
 
     all_scored = []
-    batch_size = 40
+    batch_size = 30
 
     for start in range(0, len(slim), batch_size):
         batch  = slim[start: start + batch_size]
         prompt = f"""You are a procurement analyst for a digital development organisation in Africa.
 
-Review these notices. Flag only ACTUAL PROCUREMENT OPPORTUNITIES:
-tenders, RFPs, contracts, consultancies, grants, calls for proposals.
-Do NOT flag general news, blog posts, or programme descriptions.
+Score these procurement notices for relevance. Only flag ACTUAL procurement opportunities
+(tenders, RFPs, contracts, consultancies, grants, calls for proposals).
 
-Relevant themes — flag if ANY match:
+Relevant if about ANY of:
 - Digital skills / literacy training
-- Youth training or employment programs  
-- Skills development
-- Capacity building (digital/tech)
+- Youth training or employment programs
+- Skills development / capacity building (digital/tech)
 - Entrepreneurship support or training
 - Job matching or employment technology
-- AI skills / training
+- AI skills / training programs
 - Workforce development / upskilling / reskilling
-- EdTech / e-learning
+- EdTech / e-learning platforms
 - Labor market systems
 
 Notices:
 {json.dumps(batch, indent=2)}
 
-Return a JSON array only. Each item needs:
+Return a JSON array. Each item:
 - "id": original id (integer)
 - "relevance_score": 1-10
 - "relevance_reason": one sentence
-- "themes": list of 1-3 matched themes
+- "themes": list of 1-3 themes
 
 Only include relevance_score >= 6. Return [] if nothing qualifies.
-ONLY the JSON array — no markdown, no extra text."""
+ONLY the JSON array — no markdown."""
 
         try:
             response = groq_client.chat.completions.create(
@@ -462,18 +198,18 @@ ONLY the JSON array — no markdown, no extra text."""
                     text = text[4:]
             all_scored.extend(json.loads(text.strip()))
         except Exception as e:
-            print(f"    [Groq batch] {e}")
+            print(f"    [Scoring error] {e}")
 
-    result, seen_titles = [], set()
+    result, seen = [], set()
     for s in all_scored:
         idx = s.get("id")
         if not isinstance(idx, int) or idx >= len(notices):
             continue
-        original  = notices[idx]
-        key       = original["title"].lower()[:80]
-        if key in seen_titles:
+        original = notices[idx]
+        key = original["title"].lower()[:80]
+        if key in seen:
             continue
-        seen_titles.add(key)
+        seen.add(key)
         result.append({
             **original,
             "relevance_score":  s.get("relevance_score", 0),
@@ -482,21 +218,6 @@ ONLY the JSON array — no markdown, no extra text."""
         })
 
     return result
-
-
-def keyword_fallback(notices: list[dict]) -> list[dict]:
-    results = []
-    for n in notices:
-        text = (n["title"] + " " + n.get("description", "")).lower()
-        hits = [k for k in KEYWORDS if k in text]
-        if hits:
-            results.append({
-                **n,
-                "relevance_score":  6,
-                "relevance_reason": f"Matched: {', '.join(hits[:3])}",
-                "themes":           hits[:3],
-            })
-    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,17 +229,16 @@ SOURCE_COLORS = {
     "AfDB":       "#c0392b",
     "TED":        "#2e86ab",
     "UNDP":       "#009edb",
-    "UNICEF":     "#00aeef",
-    "ReliefWeb":  "#d35400",
-    "USAID":      "#002868",
     "IMF":        "#8e44ad",
+    "USAID":      "#002868",
+    "ReliefWeb":  "#d35400",
 }
 
 def _src_color(source: str) -> str:
     for k, v in SOURCE_COLORS.items():
         if k in source:
             return v
-    return "#555"
+    return "#2c3e50"
 
 
 def build_email_html(notices: list[dict]) -> str:
@@ -531,10 +251,10 @@ def build_email_html(notices: list[dict]) -> str:
         score_color = ("#27ae60" if isinstance(score, int) and score >= 8
                        else "#e67e22" if isinstance(score, int) and score >= 6
                        else "#e74c3c")
-        src     = n.get("source", "")
-        themes  = ", ".join(n.get("themes", []))
-        meta    = " · ".join(filter(None, [n.get("country",""), str(n.get("date",""))[:10]]))
-        url     = n.get("url") or "#"
+        src    = n.get("source", "")
+        themes = ", ".join(n.get("themes", []))
+        meta   = " · ".join(filter(None, [n.get("country",""), str(n.get("date",""))[:10]]))
+        url    = n.get("url") or "#"
 
         rows += f"""
         <tr style="border-bottom:1px solid #eee;">
@@ -578,8 +298,8 @@ def build_email_html(notices: list[dict]) -> str:
         Digital Skilling · Capacity Building · Youth Employment
       </p>
       <p style="color:#85c1e9;margin:6px 0 0;font-size:13px;">
-        {today} &nbsp;·&nbsp; World Bank &nbsp;·&nbsp; AfDB &nbsp;·&nbsp; TED
-        &nbsp;·&nbsp; UNDP &nbsp;·&nbsp; ReliefWeb &nbsp;·&nbsp; USAID &nbsp;·&nbsp; IMF
+        {today} &nbsp;·&nbsp; AfDB &nbsp;·&nbsp; World Bank &nbsp;·&nbsp; IMF
+        &nbsp;·&nbsp; UNDP &nbsp;·&nbsp; TED &nbsp;·&nbsp; USAID
       </p>
     </div>
     <div style="background:#eaf4fd;padding:14px 30px;border-bottom:2px solid #d6eaf8;">
@@ -587,7 +307,7 @@ def build_email_html(notices: list[dict]) -> str:
         📊 {count} relevant opportunit{'ies' if count != 1 else 'y'} found
       </strong>
       <span style="color:#7f8c8d;font-size:13px;margin-left:10px;">
-        AI-filtered · Each title + URL links directly to the notice
+        Sourced via Groq web search · AI-filtered · Links direct to notices
       </span>
     </div>
     <div style="padding:20px 24px;">
@@ -637,39 +357,17 @@ def send_email(html_body: str, count: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("🔍 Fetching from all sources…")
-    all_notices = []
-    all_notices.extend(fetch_reliefweb())
-    all_notices.extend(fetch_world_bank())
-    all_notices.extend(fetch_ted())
-    all_notices.extend(fetch_usaid())
-    all_notices.extend(fetch_imf())
-    all_notices.extend(fetch_un_jobs())
-    all_notices.extend(fetch_afdb())
-    print(f"   Total raw: {len(all_notices)}")
+    print("🔍 Searching for procurement notices via Groq web search…")
+    notices = search_for_notices()
 
-    # Deduplicate by title
-    seen, unique = set(), []
-    for n in all_notices:
-        key = n["title"].strip().lower()[:100]
-        if key and len(key) > 5 and key not in seen:
-            seen.add(key)
-            unique.append(n)
-    print(f"   After dedup: {len(unique)}")
-
-    if not unique:
-        print("⚠️  No notices fetched from any source.")
+    if not notices:
+        print("⚠️  No notices found from any search.")
         send_email(build_email_html([]), 0)
         return
 
-    print("🤖 Filtering with Groq / Llama 3.3…")
-    relevant = filter_with_groq(unique)
-    print(f"   Groq matched: {len(relevant)}")
-
-    if not relevant:
-        print("   Trying keyword fallback…")
-        relevant = keyword_fallback(unique)
-        print(f"   Keyword fallback: {len(relevant)}")
+    print("🤖 Scoring and filtering results…")
+    relevant = score_notices(notices)
+    print(f"   Relevant: {len(relevant)}")
 
     print("📧 Sending email digest…")
     send_email(build_email_html(relevant), len(relevant))
