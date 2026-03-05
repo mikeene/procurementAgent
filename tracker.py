@@ -143,16 +143,24 @@ def filter_with_groq(notices: list[dict]) -> list[dict]:
         for i, n in enumerate(notices)
     ]
 
+    today_str  = datetime.now().strftime("%Y-%m-%d")
     all_scored = []
     batch_size = 30
 
     for start in range(0, len(slim), batch_size):
         batch  = slim[start: start + batch_size]
         prompt = f"""You are a procurement analyst for a digital development organisation in Africa.
+Today's date is {today_str}.
 
 Review these search results. Flag ONLY results that are ACTUAL PROCUREMENT OPPORTUNITIES:
 tenders, RFPs, contracts, consultancies, grants, calls for proposals.
 Do NOT flag news articles, blog posts, reports, or general programme pages.
+
+IMPORTANT — STATUS CHECK:
+- Read the description carefully for any closing date, deadline, or submission date
+- If a deadline is mentioned and it has already passed (before {today_str}), mark status "closed" and EXCLUDE it
+- If the deadline is still in the future, mark status "open"
+- If no deadline is mentioned, mark status "unknown" and still include it
 
 Mark relevant if about ANY of these themes:
 - Digital skills / digital literacy training
@@ -174,8 +182,11 @@ Return a JSON array only. Each item must have:
 - "relevance_score": 1-10 (10 = perfect procurement match)
 - "relevance_reason": one sentence explaining why
 - "themes": list of 1-3 matched themes from above
+- "status": "open", "closed", or "unknown"
+- "deadline": the closing date if found in text, else ""
 
 Only include items with relevance_score >= 6.
+Do NOT include items where status is "closed".
 Return [] if nothing qualifies.
 Respond with ONLY the JSON array — no markdown, no explanation."""
 
@@ -200,6 +211,8 @@ Respond with ONLY the JSON array — no markdown, no explanation."""
         idx = s.get("id")
         if not isinstance(idx, int) or idx >= len(notices):
             continue
+        if s.get("status") == "closed":
+            continue
         original = notices[idx]
         key = original["title"].lower()[:80]
         if key in seen:
@@ -210,6 +223,8 @@ Respond with ONLY the JSON array — no markdown, no explanation."""
             "relevance_score":  s.get("relevance_score", 0),
             "relevance_reason": s.get("relevance_reason", ""),
             "themes":           s.get("themes", []),
+            "status":           s.get("status", "unknown"),
+            "deadline":         s.get("deadline", ""),
         })
 
     return result
@@ -249,10 +264,22 @@ def build_email_html(notices: list[dict]) -> str:
         score_color = ("#27ae60" if isinstance(score, int) and score >= 8
                        else "#e67e22" if isinstance(score, int) and score >= 6
                        else "#e74c3c")
-        src    = n.get("source", "")
-        themes = ", ".join(n.get("themes", []))
-        meta   = " · ".join(filter(None, [n.get("country",""), str(n.get("date",""))[:10]]))
-        url    = n.get("url") or "#"
+        src      = n.get("source", "")
+        themes   = ", ".join(n.get("themes", []))
+        status   = n.get("status", "unknown")
+        deadline = n.get("deadline", "")
+        meta     = " · ".join(filter(None, [n.get("country",""), str(n.get("date",""))[:10]]))
+        url      = n.get("url") or "#"
+
+        # Status badge
+        if status == "open":
+            status_badge = '<span style="background:#27ae60;color:white;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">✅ OPEN</span>'
+        elif status == "closed":
+            status_badge = '<span style="background:#e74c3c;color:white;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">❌ CLOSED</span>'
+        else:
+            status_badge = '<span style="background:#95a5a6;color:white;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">❓ CHECK DEADLINE</span>'
+
+        deadline_str = f' &nbsp;·&nbsp; <strong>Deadline:</strong> {deadline}' if deadline else ""
 
         rows += f"""
         <tr style="border-bottom:1px solid #eee;">
@@ -270,6 +297,7 @@ def build_email_html(notices: list[dict]) -> str:
                       font-size:15px;line-height:1.5;">{n.get('title','Untitled')}</a><br>
             <a href="{url}" target="_blank"
                style="color:#2471a3;font-size:12px;word-break:break-all;">{url}</a>
+            <br>{status_badge}{deadline_str}
             {'<br><span style="color:#7f8c8d;font-size:12px;">' + meta + '</span>' if meta else ''}
             {'<br><em style="color:#555;font-size:13px;">' + n.get("relevance_reason","") + '</em>' if n.get("relevance_reason") else ''}
             {'<br><span style="color:#8e44ad;font-size:12px;">🏷 ' + themes + '</span>' if themes else ''}
