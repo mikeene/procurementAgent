@@ -287,13 +287,39 @@ def collect_all_results() -> list[dict]:
     seen_urls   = set()
     seen_titles = set()
 
+    # Domains that are NOT procurement sources — block them
+    BLOCKED_DOMAINS = [
+        "linkedin.com", "twitter.com", "facebook.com", "instagram.com",
+        "youtube.com", "medium.com", "substack.com", "quora.com",
+        "reddit.com", "wikipedia.org", "slideshare.net", "scribd.com",
+        "researchgate.net", "academia.edu",
+    ]
+
+    # Only accept results from known procurement/development domains
+    ALLOWED_DOMAINS = [
+        "afdb.org", "worldbank.org", "imf.org", "undp.org", "unicef.org",
+        "ted.europa.eu", "ec.europa.eu", "usaid.gov", "ungm.org",
+        "reliefweb.int", "devex.com", "adb.org", "iadb.org", "ebrd.com",
+        "globalfund.org", "giz.de", "dfid.gov.uk", "gov.uk", "europa.eu",
+        "un.org", "ilo.org", "ifc.org", "miga.org", "oecd.org",
+    ]
+
     def add_result(title, url, description, date="", country=""):
-        url_key   = url.lower()[:120]
+        url_lower = url.lower()
+        url_key   = url_lower[:120]
         title_key = title.lower()[:80]
+
         if not title or len(title) < 6:
+            return
+        # Block social media and non-procurement sites
+        if any(d in url_lower for d in BLOCKED_DOMAINS):
+            return
+        # Only allow known procurement/development domains
+        if not any(d in url_lower for d in ALLOWED_DOMAINS):
             return
         if url_key in seen_urls or title_key in seen_titles:
             return
+
         seen_urls.add(url_key)
         seen_titles.add(title_key)
         all_results.append({
@@ -349,46 +375,45 @@ def filter_with_groq(notices: list[dict]) -> list[dict]:
 
     for start in range(0, len(slim), batch_size):
         batch  = slim[start: start + batch_size]
-        prompt = f"""You are a procurement analyst for a digital development organisation in Africa.
+        prompt = f"""You are a strict procurement analyst for a digital development organisation in Africa.
 Today's date is {today_str}.
 
-Review these search results. Flag ONLY results that are ACTUAL PROCUREMENT OPPORTUNITIES:
-tenders, RFPs, contracts, consultancies, grants, calls for proposals.
-Do NOT flag news articles, blog posts, reports, or general programme pages.
+Your job is to filter a list of search results and return ONLY genuine, active procurement opportunities.
 
-IMPORTANT — STATUS CHECK:
-- Read the description carefully for any closing date, deadline, or submission date
-- If a deadline is mentioned and it has already passed (before {today_str}), mark status "closed" and EXCLUDE it
-- If the deadline is still in the future, mark status "open"
-- If no deadline is mentioned, mark status "unknown" and still include it
+STRICT INCLUSION RULES — include ONLY if ALL of these are true:
+1. It is an ACTIVE procurement opportunity: RFP, RFQ, tender, call for proposals, call for expressions of interest, consultancy contract, or grant call
+2. It is from a legitimate procurement source: AfDB, World Bank, IMF, UNDP, UN agencies, EU, USAID, or similar multilateral/bilateral institution
+3. It is relevant to at least one of: digital skills, digital literacy, youth training, youth employment, skills development, capacity building, entrepreneurship, job matching, AI training, workforce development, edtech, e-learning, vocational training, labor market systems
+4. There is NO evidence the deadline has already passed before {today_str}
 
-Mark relevant if about ANY of these themes:
-- Digital skills / digital literacy training
-- Youth training or youth employment programs
-- Skills development
-- Capacity building (digital or tech focus)
-- Entrepreneurship support or training
-- Job matching or employment technology
-- AI skills or AI training programs
-- Workforce development / upskilling / reskilling
-- EdTech or e-learning platforms
-- Labor market information systems
+STRICT EXCLUSION RULES — ALWAYS exclude:
+- News articles, press releases, blog posts, opinion pieces
+- Project descriptions or programme summaries (not procurement notices)
+- LinkedIn posts, social media content, or third-party aggregator articles
+- Any notice where the year is 2024 or earlier (likely expired)
+- Job postings (we want procurement, not employment)
+- Conference announcements or event invitations
+- Reports, studies, or research publications
+
+DEADLINE CHECK:
+- If description mentions a specific closing date before {today_str} → status: "closed", EXCLUDE
+- If closing date is after {today_str} → status: "open"
+- If no date found → status: "unknown", include with caution
 
 Results to review:
 {json.dumps(batch, indent=2)}
 
 Return a JSON array only. Each item must have:
 - "id": original id (integer)
-- "relevance_score": 1-10 (10 = perfect procurement match)
-- "relevance_reason": one sentence explaining why
-- "themes": list of 1-3 matched themes from above
-- "status": "open", "closed", or "unknown"
-- "deadline": the closing date if found in text, else ""
+- "relevance_score": 1-10
+- "relevance_reason": one sentence — name the institution and opportunity type
+- "themes": list of 1-3 matched themes
+- "status": "open" or "unknown" only (never include "closed")
+- "deadline": closing date string if found, else ""
 
-Only include items with relevance_score >= 6.
-Do NOT include items where status is "closed".
-Return [] if nothing qualifies.
-Respond with ONLY the JSON array — no markdown, no explanation."""
+Only include relevance_score >= 7 (be strict).
+Return [] if nothing clearly qualifies.
+ONLY the JSON array — no markdown, no explanation."""
 
         try:
             response = groq_client.chat.completions.create(
