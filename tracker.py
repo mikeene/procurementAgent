@@ -48,6 +48,96 @@ SEARCH_QUERIES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DEADLINE EXTRACTION — fetch each page and pull out closing date
+# ─────────────────────────────────────────────────────────────────────────────
+
+import re
+from datetime import date
+
+# Patterns that indicate a deadline/closing date in page text
+DEADLINE_PATTERNS = [
+    r'(?:closing|deadline|submission|due|apply by|closes?|applications? due)[^\d]{0,30}(\d{1,2}[\s/-]\w+[\s/-]\d{2,4})',
+    r'(?:closing|deadline|submission|due|apply by|closes?)[^\d]{0,30}(\d{4}-\d{2}-\d{2})',
+    r'(?:closing|deadline|submission|due|apply by|closes?)[^\d]{0,30}(\w+ \d{1,2},?\s*\d{4})',
+    r'(\d{1,2}[\s/-]\w+[\s/-]\d{4})(?:[^\w]{0,20}(?:closing|deadline|due))',
+]
+
+MONTH_MAP = {
+    'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+    'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12,
+    'january':1,'february':2,'march':3,'april':4,'june':6,
+    'july':7,'august':8,'september':9,'october':10,'november':11,'december':12,
+}
+
+def parse_date_str(s: str):
+    """Try to parse a date string into a date object. Returns None if unparseable."""
+    s = s.strip().lower().replace(',', '')
+    # Try YYYY-MM-DD
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', s)
+    if m:
+        try: return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except: pass
+    # Try DD Month YYYY or Month DD YYYY
+    m = re.match(r'(\d{1,2})\s+(\w+)\s+(\d{4})', s)
+    if m:
+        mon = MONTH_MAP.get(m.group(2)[:3])
+        if mon:
+            try: return date(int(m.group(3)), mon, int(m.group(1)))
+            except: pass
+    m = re.match(r'(\w+)\s+(\d{1,2})\s+(\d{4})', s)
+    if m:
+        mon = MONTH_MAP.get(m.group(1)[:3])
+        if mon:
+            try: return date(int(m.group(3)), mon, int(m.group(2)))
+            except: pass
+    # Try DD/MM/YYYY or MM/DD/YYYY
+    m = re.match(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', s)
+    if m:
+        try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except: pass
+    return None
+
+
+def fetch_deadline(url: str) -> tuple[str, str]:
+    """
+    Fetch a procurement page and extract the deadline.
+    Returns (deadline_str, status) where status is 'open', 'closed', or 'unknown'.
+    Uses Tavily Extract API — same key, no extra cost.
+    """
+    if not url or url == "#":
+        return "", "unknown"
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/extract",
+            json={"api_key": TAVILY_API_KEY, "urls": [url]},
+            headers=HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data    = resp.json()
+        results = data.get("results", [])
+        text    = results[0].get("raw_content", "") if results else ""
+        if not text:
+            return "", "unknown"
+
+        text_lower = text.lower()
+        today      = date.today()
+
+        for pattern in DEADLINE_PATTERNS:
+            matches = re.findall(pattern, text_lower, re.IGNORECASE)
+            for match in matches:
+                d = parse_date_str(match)
+                if d:
+                    status = "open" if d >= today else "closed"
+                    return d.strftime("%B %d, %Y"), status
+
+        return "", "unknown"
+
+    except Exception as e:
+        return "", "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 1: Search with Tavily
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -395,8 +485,30 @@ def main():
     relevant = filter_with_groq(notices)
     print(f"   Relevant: {len(relevant)}")
 
+    # Fetch actual deadlines by visiting each page
+    print("📅 Fetching deadlines from notice pages…")
+    confirmed = []
+    for n in relevant:
+        # Skip fetching if Groq already found a real deadline
+        if n.get("deadline") and n.get("status") in ("open", "closed"):
+            if n.get("status") == "closed":
+                print(f"    Skipping closed: {n['title'][:60]}")
+                continue
+            confirmed.append(n)
+            continue
+
+        deadline, status = fetch_deadline(n.get("url", ""))
+        if status == "closed":
+            print(f"    Closed (deadline passed): {n['title'][:60]}")
+            continue  # drop it
+        n["deadline"] = deadline or n.get("deadline", "")
+        n["status"]   = status
+        confirmed.append(n)
+
+    print(f"   After deadline check: {len(confirmed)} open/unknown notices")
+
     print("📧 Sending email digest…")
-    send_email(build_email_html(relevant), len(relevant))
+    send_email(build_email_html(confirmed), len(confirmed))
 
 
 if __name__ == "__main__":
