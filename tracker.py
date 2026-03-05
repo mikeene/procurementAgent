@@ -1,16 +1,13 @@
 """
-Procurement Intelligence Bot — v6
+Procurement Intelligence Bot — v7
 
-Key insight: Most procurement APIs block GitHub Actions IPs.
-Solution: Use Groq's built-in web_search tool — Groq fetches the web
-on our behalf from their own servers, bypassing all IP blocks.
-
-Groq searches for procurement notices, returns structured results,
-then we filter and email them.
-
-AI      : Groq / Llama 3.3 with web_search tool (free)
-Email   : Gmail SMTP (free)
-Hosting : GitHub Actions (free)
+Architecture:
+  SEARCH : Tavily API — purpose-built web search for AI agents
+           Free tier: 1,000 searches/month, no credit card needed
+           Signs up at: https://tavily.com
+  FILTER : Groq / Llama 3.3 (free)
+  EMAIL  : Gmail SMTP (free)
+  HOSTING: GitHub Actions (free)
 """
 
 import os
@@ -19,8 +16,10 @@ import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import requests
 from groq import Groq
 
+TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
 EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
 EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
@@ -28,116 +27,109 @@ EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+HEADERS = {"Content-Type": "application/json"}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1: Use Groq web search to find procurement notices
-# Groq fetches from its own servers — not blocked like GitHub Actions IPs
+# Search queries — targeted at the exact sources and topics you care about
 # ─────────────────────────────────────────────────────────────────────────────
 
 SEARCH_QUERIES = [
-    # AfDB specific
-    'site:afdb.org procurement "digital skills" OR "capacity building" OR "youth employment" 2024 OR 2025',
-    'site:afdb.org procurement "skills development" OR "entrepreneurship" OR "job matching"',
-    # World Bank specific
-    'site:worldbank.org OR site:projects.worldbank.org procurement "digital skills" OR "youth employment" OR "capacity building"',
-    'site:worldbank.org procurement "skills development" OR "entrepreneurship" OR "workforce development"',
-    # IMF specific
-    'site:imf.org procurement OR tender "digital skills" OR "capacity building" OR "training"',
-    # EU TED
-    'site:ted.europa.eu "digital skills" OR "capacity building" OR "youth employment" tender 2024 OR 2025',
-    # UNDP / UN
-    'site:undp.org procurement "digital skills" OR "capacity building" OR "youth employment" tender',
-    'procurement tender "digital skills training" Africa 2025',
-    'RFP "capacity building" "youth employment" Africa multilateral 2025',
-    'tender "job matching platform" OR "skills development" Africa development bank 2025',
+    'AfDB procurement "digital skills" OR "capacity building" OR "youth employment" tender 2025',
+    'AfDB procurement "skills development" OR "entrepreneurship" OR "job matching" 2025',
+    'World Bank procurement "digital skills" OR "youth employment" OR "capacity building" tender 2025',
+    'World Bank procurement "skills development" OR "entrepreneurship" OR "workforce" 2025',
+    'IMF procurement tender "digital skills" OR "capacity building" OR "training" 2025',
+    'UNDP procurement tender "digital skills" OR "youth employment" OR "capacity building" 2025',
+    'EU tender "digital skills training" OR "capacity building" OR "youth employment" Africa 2025',
+    'RFP tender "digital skills" OR "job matching platform" Africa development 2025',
+    'procurement tender "AI skills training" OR "entrepreneurship development" Africa 2025',
+    'procurement RFP "skills development" OR "vocational training" Africa multilateral 2025',
 ]
 
 
-def search_for_notices() -> list[dict]:
-    """Use Groq web search tool to find procurement notices."""
-    all_notices = []
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1: Search with Tavily
+# ─────────────────────────────────────────────────────────────────────────────
+
+def search_tavily(query: str) -> list[dict]:
+    """Run a single Tavily search and return raw results."""
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key":        TAVILY_API_KEY,
+                "query":          query,
+                "search_depth":   "basic",
+                "max_results":    8,
+                "include_answer": False,
+            },
+            headers=HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except Exception as e:
+        print(f"    [Tavily error] {e}")
+        return []
+
+
+def collect_all_results() -> list[dict]:
+    """Run all search queries and deduplicate results."""
+    all_results = []
+    seen_urls   = set()
     seen_titles = set()
 
-    print(f"  Running {len(SEARCH_QUERIES)} web searches via Groq…")
+    print(f"  Running {len(SEARCH_QUERIES)} searches via Tavily…")
 
     for i, query in enumerate(SEARCH_QUERIES, 1):
         print(f"    [{i}/{len(SEARCH_QUERIES)}] {query[:80]}…")
-        try:
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a procurement research assistant. "
-                            "When given a search query, search the web and extract procurement notices. "
-                            "Return ONLY a JSON array of results. Each item must have: "
-                            "title, url, source, description, date, country. "
-                            "Only include actual procurement opportunities (tenders, RFPs, contracts, grants). "
-                            "If no relevant results found, return []."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Search for: {query}\n\n"
-                            "Return results as a JSON array with fields: "
-                            "title, url, source, description, date, country. "
-                            "Only actual procurement opportunities. Return [] if none found."
-                        ),
-                    },
-                ],
-                tools=[{"type": "web_search"}],
-                tool_choice="auto",
-                max_tokens=2048,
-            )
+        results = search_tavily(query)
 
-            # Extract text from response (may include tool use blocks)
-            full_text = ""
-            for block in response.choices[0].message.content if isinstance(response.choices[0].message.content, list) else []:
-                if hasattr(block, "text"):
-                    full_text += block.text
-            if not full_text:
-                full_text = response.choices[0].message.content or ""
+        for r in results:
+            url   = (r.get("url") or "").strip()
+            title = (r.get("title") or "").strip()
 
-            # Parse JSON from response
-            if "[" in full_text and "]" in full_text:
-                start = full_text.index("[")
-                end   = full_text.rindex("]") + 1
-                json_str = full_text[start:end]
-                results  = json.loads(json_str)
+            # Skip duplicates
+            url_key   = url.lower()[:120]
+            title_key = title.lower()[:80]
+            if url_key in seen_urls or title_key in seen_titles:
+                continue
+            if url_key:
+                seen_urls.add(url_key)
+            if title_key:
+                seen_titles.add(title_key)
 
-                for item in results:
-                    title = (item.get("title") or "").strip()
-                    if not title or len(title) < 6:
-                        continue
-                    key = title.lower()[:80]
-                    if key in seen_titles:
-                        continue
-                    seen_titles.add(key)
-                    all_notices.append({
-                        "source":      item.get("source", "Web Search"),
-                        "title":       title,
-                        "description": (item.get("description") or "")[:300],
-                        "url":         item.get("url", ""),
-                        "date":        item.get("date", ""),
-                        "country":     item.get("country", ""),
-                    })
+            # Determine source from URL
+            source = "Web"
+            if "afdb.org" in url:               source = "AfDB"
+            elif "worldbank.org" in url:         source = "World Bank"
+            elif "imf.org" in url:               source = "IMF"
+            elif "undp.org" in url:              source = "UNDP"
+            elif "ted.europa.eu" in url:         source = "TED (EU Tenders)"
+            elif "reliefweb.int" in url:         source = "ReliefWeb"
+            elif "usaid.gov" in url:             source = "USAID"
+            elif "ungm.org" in url:              source = "UNGM"
+            elif "devex.com" in url:             source = "DevEx"
+            elif "unicef.org" in url:            source = "UNICEF"
 
-        except json.JSONDecodeError:
-            pass  # Model returned text instead of JSON — skip
-        except Exception as e:
-            print(f"      [Search error] {e}")
+            all_results.append({
+                "source":      source,
+                "title":       title,
+                "description": (r.get("content") or r.get("snippet") or "")[:400],
+                "url":         url,
+                "date":        r.get("published_date", ""),
+                "country":     "",
+            })
 
-    print(f"  Found {len(all_notices)} unique notices from web search")
-    return all_notices
+    print(f"  Total unique results: {len(all_results)}")
+    return all_results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2: Score and filter with Groq
+# STEP 2: Filter with Groq
 # ─────────────────────────────────────────────────────────────────────────────
 
-def score_notices(notices: list[dict]) -> list[dict]:
-    """Score already-filtered notices for relevance and quality."""
+def filter_with_groq(notices: list[dict]) -> list[dict]:
     if not notices:
         return []
 
@@ -146,7 +138,7 @@ def score_notices(notices: list[dict]) -> list[dict]:
             "id":          i,
             "source":      n["source"],
             "title":       n["title"][:200],
-            "description": n.get("description", "")[:250],
+            "description": n.get("description", "")[:300],
         }
         for i, n in enumerate(notices)
     ]
@@ -158,31 +150,34 @@ def score_notices(notices: list[dict]) -> list[dict]:
         batch  = slim[start: start + batch_size]
         prompt = f"""You are a procurement analyst for a digital development organisation in Africa.
 
-Score these procurement notices for relevance. Only flag ACTUAL procurement opportunities
-(tenders, RFPs, contracts, consultancies, grants, calls for proposals).
+Review these search results. Flag ONLY results that are ACTUAL PROCUREMENT OPPORTUNITIES:
+tenders, RFPs, contracts, consultancies, grants, calls for proposals.
+Do NOT flag news articles, blog posts, reports, or general programme pages.
 
-Relevant if about ANY of:
-- Digital skills / literacy training
-- Youth training or employment programs
-- Skills development / capacity building (digital/tech)
+Mark relevant if about ANY of these themes:
+- Digital skills / digital literacy training
+- Youth training or youth employment programs
+- Skills development
+- Capacity building (digital or tech focus)
 - Entrepreneurship support or training
 - Job matching or employment technology
-- AI skills / training programs
+- AI skills or AI training programs
 - Workforce development / upskilling / reskilling
-- EdTech / e-learning platforms
-- Labor market systems
+- EdTech or e-learning platforms
+- Labor market information systems
 
-Notices:
+Results to review:
 {json.dumps(batch, indent=2)}
 
-Return a JSON array. Each item:
+Return a JSON array only. Each item must have:
 - "id": original id (integer)
-- "relevance_score": 1-10
-- "relevance_reason": one sentence
-- "themes": list of 1-3 themes
+- "relevance_score": 1-10 (10 = perfect procurement match)
+- "relevance_reason": one sentence explaining why
+- "themes": list of 1-3 matched themes from above
 
-Only include relevance_score >= 6. Return [] if nothing qualifies.
-ONLY the JSON array — no markdown."""
+Only include items with relevance_score >= 6.
+Return [] if nothing qualifies.
+Respond with ONLY the JSON array — no markdown, no explanation."""
 
         try:
             response = groq_client.chat.completions.create(
@@ -198,7 +193,7 @@ ONLY the JSON array — no markdown."""
                     text = text[4:]
             all_scored.extend(json.loads(text.strip()))
         except Exception as e:
-            print(f"    [Scoring error] {e}")
+            print(f"    [Groq batch error] {e}")
 
     result, seen = [], set()
     for s in all_scored:
@@ -232,6 +227,9 @@ SOURCE_COLORS = {
     "IMF":        "#8e44ad",
     "USAID":      "#002868",
     "ReliefWeb":  "#d35400",
+    "UNICEF":     "#00aeef",
+    "UNGM":       "#16a085",
+    "DevEx":      "#7f8c8d",
 }
 
 def _src_color(source: str) -> str:
@@ -299,7 +297,7 @@ def build_email_html(notices: list[dict]) -> str:
       </p>
       <p style="color:#85c1e9;margin:6px 0 0;font-size:13px;">
         {today} &nbsp;·&nbsp; AfDB &nbsp;·&nbsp; World Bank &nbsp;·&nbsp; IMF
-        &nbsp;·&nbsp; UNDP &nbsp;·&nbsp; TED &nbsp;·&nbsp; USAID
+        &nbsp;·&nbsp; UNDP &nbsp;·&nbsp; TED &nbsp;·&nbsp; USAID &amp; more
       </p>
     </div>
     <div style="background:#eaf4fd;padding:14px 30px;border-bottom:2px solid #d6eaf8;">
@@ -307,7 +305,7 @@ def build_email_html(notices: list[dict]) -> str:
         📊 {count} relevant opportunit{'ies' if count != 1 else 'y'} found
       </strong>
       <span style="color:#7f8c8d;font-size:13px;margin-left:10px;">
-        Sourced via Groq web search · AI-filtered · Links direct to notices
+        Sourced via Tavily · AI-filtered by Groq · Links direct to notices
       </span>
     </div>
     <div style="padding:20px 24px;">
@@ -328,7 +326,7 @@ def build_email_html(notices: list[dict]) -> str:
     <div style="background:#f4f6f8;padding:16px 30px;text-align:center;
                 border-top:1px solid #dde4ea;">
       <p style="color:#aab0b8;font-size:12px;margin:0;">
-        Procurement Bot · GitHub Actions · Groq / Llama 3.3 · 100% Free
+        Procurement Bot · GitHub Actions · Tavily + Groq · 100% Free
       </p>
     </div>
   </div>
@@ -357,16 +355,16 @@ def send_email(html_body: str, count: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("🔍 Searching for procurement notices via Groq web search…")
-    notices = search_for_notices()
+    print("🔍 Searching for procurement notices via Tavily…")
+    notices = collect_all_results()
 
     if not notices:
-        print("⚠️  No notices found from any search.")
+        print("⚠️  No results from any search.")
         send_email(build_email_html([]), 0)
         return
 
-    print("🤖 Scoring and filtering results…")
-    relevant = score_notices(notices)
+    print("🤖 Filtering with Groq / Llama 3.3…")
+    relevant = filter_with_groq(notices)
     print(f"   Relevant: {len(relevant)}")
 
     print("📧 Sending email digest…")
