@@ -34,4 +34,5 @@ jobs:
           EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT:  ${{ secrets.EMAIL_RECIPIENT }}
+          TAVILY_API_KEY:   ${{ secrets.TAVILY_API_KEY }}
         run: python tracker.py
