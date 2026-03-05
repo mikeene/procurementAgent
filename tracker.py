@@ -34,16 +34,30 @@ HEADERS = {"Content-Type": "application/json"}
 # ─────────────────────────────────────────────────────────────────────────────
 
 SEARCH_QUERIES = [
-    'AfDB procurement "digital skills" OR "capacity building" OR "youth employment" tender 2025',
-    'AfDB procurement "skills development" OR "entrepreneurship" OR "job matching" 2025',
-    'World Bank procurement "digital skills" OR "youth employment" OR "capacity building" tender 2025',
-    'World Bank procurement "skills development" OR "entrepreneurship" OR "workforce" 2025',
-    'IMF procurement tender "digital skills" OR "capacity building" OR "training" 2025',
-    'UNDP procurement tender "digital skills" OR "youth employment" OR "capacity building" 2025',
-    'EU tender "digital skills training" OR "capacity building" OR "youth employment" Africa 2025',
-    'RFP tender "digital skills" OR "job matching platform" Africa development 2025',
-    'procurement tender "AI skills training" OR "entrepreneurship development" Africa 2025',
-    'procurement RFP "skills development" OR "vocational training" Africa multilateral 2025',
+    # AfDB — direct site search for open procurement notices
+    'site:afdb.org "request for proposals" OR "request for quotation" OR "call for tenders" 2025',
+    'site:afdb.org procurement "digital skills" OR "capacity building" OR "youth" OR "entrepreneurship" 2025',
+    # World Bank
+    'site:projects.worldbank.org "digital skills" OR "capacity building" OR "youth employment" OR "job matching" procurement 2025',
+    'site:worldbank.org "request for proposals" OR "request for expressions of interest" "digital" OR "skills" OR "youth" 2025',
+    # IMF & UNDP
+    'site:imf.org OR site:undp.org procurement tender "digital skills" OR "capacity building" OR "youth employment" 2025',
+    # EU / TED
+    'site:ted.europa.eu "digital skills" OR "capacity building" OR "youth employment" OR "entrepreneurship" tender Africa 2025',
+    # Broad development sector
+    'RFP tender "digital skills training" OR "youth employment" OR "job matching platform" Africa 2025 deadline',
+    'procurement "AI skills" OR "digital literacy" OR "entrepreneurship training" Africa multilateral 2025 open',
+    'UNDP OR "African Development Bank" OR "World Bank" RFP "skills development" OR "capacity building" 2025',
+    'tender "vocational training" OR "workforce development" OR "edtech" Africa development bank 2025',
+]
+
+# AfDB direct portal pages to extract notices from
+AFDB_DIRECT_URLS = [
+    "https://www.afdb.org/en/projects-and-operations/procurement",
+    "https://www.afdb.org/en/projects-and-operations/procurement?field_procurement_notice_type_tid=All&field_country_tid=All&title=digital",
+    "https://www.afdb.org/en/projects-and-operations/procurement?title=capacity+building",
+    "https://www.afdb.org/en/projects-and-operations/procurement?title=youth",
+    "https://www.afdb.org/en/projects-and-operations/procurement?title=skills",
 ]
 
 
@@ -131,7 +145,39 @@ def fetch_deadline(url: str) -> tuple[str, str]:
                     status = "open" if d >= today else "closed"
                     return d.strftime("%B %d, %Y"), status
 
-        return "", "unknown"
+        # Regex found nothing — ask Groq to extract the deadline from page text
+        try:
+            snippet = text[:3000]  # first 3000 chars usually has the deadline
+            today_str = today.strftime("%Y-%m-%d")
+            resp = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Today is {today_str}.\n"
+                        "Read this procurement page text and find the CLOSING DATE or DEADLINE for submission.\n"
+                        "Return ONLY a JSON object: {\"deadline\": \"YYYY-MM-DD or empty string\", \"status\": \"open|closed|unknown\"}\n"
+                        "If no deadline is found, return {\"deadline\": \"\", \"status\": \"unknown\"}.\n"
+                        f"Page text:\n{snippet}"
+                    )
+                }],
+                temperature=0,
+                max_tokens=100,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if "{" in raw:
+                raw = raw[raw.index("{"):raw.rindex("}")+1]
+            parsed = json.loads(raw)
+            dl     = parsed.get("deadline", "")
+            st     = parsed.get("status", "unknown")
+            if dl:
+                d = parse_date_str(dl)
+                if d:
+                    st = "open" if d >= today else "closed"
+                    return d.strftime("%B %d, %Y"), st
+            return "", st
+        except Exception:
+            return "", "unknown"
 
     except Exception as e:
         return "", "unknown"
@@ -141,7 +187,20 @@ def fetch_deadline(url: str) -> tuple[str, str]:
 # STEP 1: Search with Tavily
 # ─────────────────────────────────────────────────────────────────────────────
 
-def search_tavily(query: str) -> list[dict]:
+def source_from_url(url: str) -> str:
+    if "afdb.org" in url:        return "AfDB"
+    if "worldbank.org" in url:   return "World Bank"
+    if "imf.org" in url:         return "IMF"
+    if "undp.org" in url:        return "UNDP"
+    if "ted.europa.eu" in url:   return "TED (EU Tenders)"
+    if "reliefweb.int" in url:   return "ReliefWeb"
+    if "usaid.gov" in url:       return "USAID"
+    if "ungm.org" in url:        return "UNGM"
+    if "unicef.org" in url:      return "UNICEF"
+    return "Web"
+
+
+def search_tavily(query: str, depth: str = "advanced") -> list[dict]:
     """Run a single Tavily search and return raw results."""
     try:
         resp = requests.post(
@@ -149,7 +208,7 @@ def search_tavily(query: str) -> list[dict]:
             json={
                 "api_key":        TAVILY_API_KEY,
                 "query":          query,
-                "search_depth":   "basic",
+                "search_depth":   depth,
                 "max_results":    8,
                 "include_answer": False,
             },
@@ -159,57 +218,108 @@ def search_tavily(query: str) -> list[dict]:
         resp.raise_for_status()
         return resp.json().get("results", [])
     except Exception as e:
-        print(f"    [Tavily error] {e}")
+        print(f"    [Tavily search error] {e}")
         return []
 
 
+def extract_afdb_direct() -> list[dict]:
+    """
+    Use Tavily Extract to pull notices directly from AfDB procurement pages.
+    This bypasses search engine indexing gaps and hits the portal directly.
+    """
+    notices = []
+    seen    = set()
+    print("  Extracting AfDB procurement portal directly…")
+
+    for url in AFDB_DIRECT_URLS:
+        try:
+            resp = requests.post(
+                "https://api.tavily.com/extract",
+                json={"api_key": TAVILY_API_KEY, "urls": [url]},
+                headers=HEADERS,
+                timeout=25,
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            text    = results[0].get("raw_content", "") if results else ""
+            if not text:
+                continue
+
+            # Parse procurement notice blocks from the extracted text
+            # AfDB pages list notices as: Title | Country | Closing Date | Type
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            for i, line in enumerate(lines):
+                # Look for lines that look like procurement notice titles
+                if len(line) < 15 or len(line) > 300:
+                    continue
+                lower = line.lower()
+                if any(kw in lower for kw in [
+                    "request for proposal", "request for quotation", "call for tender",
+                    "expression of interest", "rfp", "rfq", "consulting", "consultant",
+                    "procurement", "invitation to bid", "call for proposal",
+                ]):
+                    # Grab surrounding context as description
+                    ctx_start = max(0, i-1)
+                    ctx_end   = min(len(lines), i+3)
+                    desc      = " | ".join(lines[ctx_start:ctx_end])[:400]
+                    key       = line.lower()[:80]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    notices.append({
+                        "source":      "AfDB",
+                        "title":       line,
+                        "description": desc,
+                        "url":         url,
+                        "date":        "",
+                        "country":     "",
+                    })
+        except Exception as e:
+            print(f"    [AfDB extract {url[:50]}] {e}")
+
+    print(f"    AfDB direct: {len(notices)} notices")
+    return notices
+
+
 def collect_all_results() -> list[dict]:
-    """Run all search queries and deduplicate results."""
+    """Run all search queries + direct AfDB extraction, deduplicated."""
     all_results = []
     seen_urls   = set()
     seen_titles = set()
 
-    print(f"  Running {len(SEARCH_QUERIES)} searches via Tavily…")
+    def add_result(title, url, description, date="", country=""):
+        url_key   = url.lower()[:120]
+        title_key = title.lower()[:80]
+        if not title or len(title) < 6:
+            return
+        if url_key in seen_urls or title_key in seen_titles:
+            return
+        seen_urls.add(url_key)
+        seen_titles.add(title_key)
+        all_results.append({
+            "source":      source_from_url(url),
+            "title":       title,
+            "description": description[:400],
+            "url":         url,
+            "date":        date,
+            "country":     country,
+        })
 
+    # Direct AfDB portal extraction
+    for n in extract_afdb_direct():
+        add_result(n["title"], n["url"], n["description"])
+
+    # Web searches
+    print(f"  Running {len(SEARCH_QUERIES)} web searches via Tavily…")
     for i, query in enumerate(SEARCH_QUERIES, 1):
         print(f"    [{i}/{len(SEARCH_QUERIES)}] {query[:80]}…")
-        results = search_tavily(query)
-
-        for r in results:
-            url   = (r.get("url") or "").strip()
-            title = (r.get("title") or "").strip()
-
-            # Skip duplicates
-            url_key   = url.lower()[:120]
-            title_key = title.lower()[:80]
-            if url_key in seen_urls or title_key in seen_titles:
-                continue
-            if url_key:
-                seen_urls.add(url_key)
-            if title_key:
-                seen_titles.add(title_key)
-
-            # Determine source from URL
-            source = "Web"
-            if "afdb.org" in url:               source = "AfDB"
-            elif "worldbank.org" in url:         source = "World Bank"
-            elif "imf.org" in url:               source = "IMF"
-            elif "undp.org" in url:              source = "UNDP"
-            elif "ted.europa.eu" in url:         source = "TED (EU Tenders)"
-            elif "reliefweb.int" in url:         source = "ReliefWeb"
-            elif "usaid.gov" in url:             source = "USAID"
-            elif "ungm.org" in url:              source = "UNGM"
-            elif "devex.com" in url:             source = "DevEx"
-            elif "unicef.org" in url:            source = "UNICEF"
-
-            all_results.append({
-                "source":      source,
-                "title":       title,
-                "description": (r.get("content") or r.get("snippet") or "")[:400],
-                "url":         url,
-                "date":        r.get("published_date", ""),
-                "country":     "",
-            })
+        for r in search_tavily(query):
+            add_result(
+                r.get("title", ""),
+                r.get("url", ""),
+                r.get("content") or r.get("snippet") or "",
+                r.get("published_date", ""),
+            )
 
     print(f"  Total unique results: {len(all_results)}")
     return all_results
