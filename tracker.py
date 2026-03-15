@@ -51,13 +51,45 @@ SEARCH_QUERIES = [
     'tender "vocational training" OR "workforce development" OR "edtech" Africa development bank 2025',
 ]
 
-# AfDB direct portal pages to extract notices from
-AFDB_DIRECT_URLS = [
-    "https://www.afdb.org/en/projects-and-operations/procurement",
-    "https://www.afdb.org/en/projects-and-operations/procurement?field_procurement_notice_type_tid=All&field_country_tid=All&title=digital",
-    "https://www.afdb.org/en/projects-and-operations/procurement?title=capacity+building",
-    "https://www.afdb.org/en/projects-and-operations/procurement?title=youth",
-    "https://www.afdb.org/en/projects-and-operations/procurement?title=skills",
+# ── Direct portal URLs with pagination ───────────────────────────────────────
+# Each entry: (source_name, url_template, page_param, start_page, max_pages)
+# url_template uses {page} as placeholder for the page number
+
+PORTAL_CONFIGS = [
+    {
+        "source":     "AfDB",
+        "url":        "https://www.afdb.org/en/projects-and-operations/procurement?page={page}",
+        "start_page": 0,       # AfDB uses 0-based pages (?page=0, ?page=1 …)
+        "max_pages":  5,       # crawl up to 5 pages
+    },
+    {
+        "source":     "World Bank",
+        "url":        "https://projects.worldbank.org/en/projects-operations/opportunities?srce=both&page={page}",
+        "start_page": 1,       # World Bank uses 1-based pages
+        "max_pages":  5,
+    },
+    {
+        "source":     "EU",
+        "url":        "https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/calls-for-tenders?order=DESC&pageNumber={page}&pageSize=50&sortBy=startDate&isExactMatch=true",
+        "start_page": 1,       # EU uses 1-based pageNumber
+        "max_pages":  3,       # EU pages are large (50 results each)
+    },
+]
+
+# Keywords that confirm a line is a procurement notice title
+PROCUREMENT_KEYWORDS = [
+    "request for proposal", "request for quotation", "call for tender",
+    "call for proposal", "expression of interest", "invitation to bid",
+    "rfp", "rfq", "eoi", "itb", "consulting services", "consultancy",
+    "procurement notice", "bid notice", "contract award",
+]
+
+# Keywords that indicate relevant topic areas
+TOPIC_KEYWORDS = [
+    "digital skill", "digital literac", "youth", "capacity build",
+    "entrepreneurship", "job match", "workforce", "upskill", "reskill",
+    "edtech", "e-learning", "vocational", "labor market", "employment",
+    "skills development", "training", "human capital", "ai skill",
 ]
 
 
@@ -222,63 +254,136 @@ def search_tavily(query: str, depth: str = "advanced") -> list[dict]:
         return []
 
 
-def extract_afdb_direct() -> list[dict]:
-    """
-    Use Tavily Extract to pull notices directly from AfDB procurement pages.
-    This bypasses search engine indexing gaps and hits the portal directly.
-    """
-    notices = []
-    seen    = set()
-    print("  Extracting AfDB procurement portal directly…")
+def tavily_extract(url: str) -> str:
+    """Extract full page content via Tavily — bypasses bot blocks."""
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/extract",
+            json={"api_key": TAVILY_API_KEY, "urls": [url]},
+            headers=HEADERS,
+            timeout=25,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        return results[0].get("raw_content", "") if results else ""
+    except Exception as e:
+        print(f"    [Tavily extract error] {e}")
+        return ""
 
-    for url in AFDB_DIRECT_URLS:
-        try:
-            resp = requests.post(
-                "https://api.tavily.com/extract",
-                json={"api_key": TAVILY_API_KEY, "urls": [url]},
-                headers=HEADERS,
-                timeout=25,
-            )
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-            text    = results[0].get("raw_content", "") if results else ""
-            if not text:
+
+def parse_notices_from_text(text: str, source: str, listing_url: str) -> list[dict]:
+    """
+    Parse a procurement listing page extracted as plain text.
+    Uses Groq to extract structured notice data from the raw text.
+    This is more reliable than regex for varied page layouts.
+    """
+    if not text or len(text) < 100:
+        return []
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    try:
+        prompt = f"""You are parsing a procurement portal listing page for {source}.
+Today is {today_str}.
+
+The text below is the raw content of a procurement listing page.
+Extract all individual procurement notices/opportunities listed on this page.
+
+For each notice found, return:
+- "title": the notice title
+- "url": any direct link/URL to the notice (if visible in text), else use "{listing_url}"
+- "deadline": closing/deadline date if shown (YYYY-MM-DD format), else ""
+- "country": country if shown, else ""
+- "description": brief description if available, else ""
+
+ONLY include items that are actual procurement notices (RFP, RFQ, tender, call for proposals, EOI).
+ONLY include notices from 2025 or later — skip anything from 2024 or earlier.
+If deadline has already passed before {today_str}, skip it.
+
+Raw page text (first 6000 chars):
+{text[:6000]}
+
+Return ONLY a JSON array. No markdown, no explanation."""
+
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=3000,
+        )
+        raw = response.choices[0].message.content.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        items = json.loads(raw.strip())
+
+        notices = []
+        for item in items:
+            title = (item.get("title") or "").strip()
+            if not title or len(title) < 8:
                 continue
+            notices.append({
+                "source":      source,
+                "title":       title,
+                "url":         item.get("url") or listing_url,
+                "deadline":    item.get("deadline", ""),
+                "country":     item.get("country", ""),
+                "description": item.get("description", ""),
+                "date":        item.get("deadline", ""),
+            })
+        return notices
 
-            # Parse procurement notice blocks from the extracted text
-            # AfDB pages list notices as: Title | Country | Closing Date | Type
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            for i, line in enumerate(lines):
-                # Look for lines that look like procurement notice titles
-                if len(line) < 15 or len(line) > 300:
-                    continue
-                lower = line.lower()
-                if any(kw in lower for kw in [
-                    "request for proposal", "request for quotation", "call for tender",
-                    "expression of interest", "rfp", "rfq", "consulting", "consultant",
-                    "procurement", "invitation to bid", "call for proposal",
-                ]):
-                    # Grab surrounding context as description
-                    ctx_start = max(0, i-1)
-                    ctx_end   = min(len(lines), i+3)
-                    desc      = " | ".join(lines[ctx_start:ctx_end])[:400]
-                    key       = line.lower()[:80]
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    notices.append({
-                        "source":      "AfDB",
-                        "title":       line,
-                        "description": desc,
-                        "url":         url,
-                        "date":        "",
-                        "country":     "",
-                    })
-        except Exception as e:
-            print(f"    [AfDB extract {url[:50]}] {e}")
+    except Exception as e:
+        print(f"    [parse_notices error] {e}")
+        return []
 
-    print(f"    AfDB direct: {len(notices)} notices")
-    return notices
+
+def crawl_portals() -> list[dict]:
+    """
+    Crawl procurement portals page by page using Tavily Extract.
+    Tavily fetches from their servers — bypasses all bot blocks.
+    Stops early if a page returns no new notices (end of listing reached).
+    """
+    all_notices = []
+    seen_titles = set()
+
+    for config in PORTAL_CONFIGS:
+        source    = config["source"]
+        url_tmpl  = config["url"]
+        start     = config["start_page"]
+        max_pages = config["max_pages"]
+
+        print(f"  Crawling {source} (up to {max_pages} pages)…")
+
+        for page_num in range(start, start + max_pages):
+            url = url_tmpl.replace("{page}", str(page_num))
+            print(f"    Page {page_num}: {url[:90]}…")
+
+            text = tavily_extract(url)
+            if not text:
+                print(f"    No content — stopping {source} pagination")
+                break
+
+            print(f"    Got {len(text)} chars — parsing…")
+            notices = parse_notices_from_text(text, source, url)
+            print(f"    Found {len(notices)} notices on page {page_num}")
+
+            new_on_page = 0
+            for n in notices:
+                key = n["title"].lower()[:80]
+                if key not in seen_titles:
+                    seen_titles.add(key)
+                    all_notices.append(n)
+                    new_on_page += 1
+
+            # Stop paginating if no new notices found on this page
+            if new_on_page == 0:
+                print(f"    No new notices on page {page_num} — stopping {source} pagination")
+                break
+
+    print(f"  Portal crawl total: {len(all_notices)} notices")
+    return all_notices
 
 
 def collect_all_results() -> list[dict]:
@@ -331,12 +436,12 @@ def collect_all_results() -> list[dict]:
             "country":     country,
         })
 
-    # Direct AfDB portal extraction
-    for n in extract_afdb_direct():
-        add_result(n["title"], n["url"], n["description"])
+    # STEP 1: Direct portal crawl — most reliable, uses exact URLs you provided
+    for n in crawl_portals():
+        add_result(n["title"], n["url"], n.get("description",""), n.get("date",""), n.get("country",""))
 
-    # Web searches
-    print(f"  Running {len(SEARCH_QUERIES)} web searches via Tavily…")
+    # STEP 2: Supplementary web searches for anything the portals missed
+    print(f"  Running {len(SEARCH_QUERIES)} supplementary web searches…")
     for i, query in enumerate(SEARCH_QUERIES, 1):
         print(f"    [{i}/{len(SEARCH_QUERIES)}] {query[:80]}…")
         for r in search_tavily(query):
