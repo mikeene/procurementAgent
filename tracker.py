@@ -33,24 +33,6 @@ HEADERS = {"Content-Type": "application/json"}
 # Search queries — targeted at the exact sources and topics you care about
 # ─────────────────────────────────────────────────────────────────────────────
 
-SEARCH_QUERIES = [
-    # AfDB — direct site search for open procurement notices
-    'site:afdb.org "request for proposals" OR "request for quotation" OR "call for tenders" 2025',
-    'site:afdb.org procurement "digital skills" OR "capacity building" OR "youth" OR "entrepreneurship" 2025',
-    # World Bank
-    'site:projects.worldbank.org "digital skills" OR "capacity building" OR "youth employment" OR "job matching" procurement 2025',
-    'site:worldbank.org "request for proposals" OR "request for expressions of interest" "digital" OR "skills" OR "youth" 2025',
-    # IMF & UNDP
-    'site:imf.org OR site:undp.org procurement tender "digital skills" OR "capacity building" OR "youth employment" 2025',
-    # EU / TED
-    'site:ted.europa.eu "digital skills" OR "capacity building" OR "youth employment" OR "entrepreneurship" tender Africa 2025',
-    # Broad development sector
-    'RFP tender "digital skills training" OR "youth employment" OR "job matching platform" Africa 2025 deadline',
-    'procurement "AI skills" OR "digital literacy" OR "entrepreneurship training" Africa multilateral 2025 open',
-    'UNDP OR "African Development Bank" OR "World Bank" RFP "skills development" OR "capacity building" 2025',
-    'tender "vocational training" OR "workforce development" OR "edtech" Africa development bank 2025',
-]
-
 # ── Direct portal URLs with pagination ───────────────────────────────────────
 # Each entry: (source_name, url_template, page_param, start_page, max_pages)
 # url_template uses {page} as placeholder for the page number
@@ -76,21 +58,7 @@ PORTAL_CONFIGS = [
     },
 ]
 
-# Keywords that confirm a line is a procurement notice title
-PROCUREMENT_KEYWORDS = [
-    "request for proposal", "request for quotation", "call for tender",
-    "call for proposal", "expression of interest", "invitation to bid",
-    "rfp", "rfq", "eoi", "itb", "consulting services", "consultancy",
-    "procurement notice", "bid notice", "contract award",
-]
 
-# Keywords that indicate relevant topic areas
-TOPIC_KEYWORDS = [
-    "digital skill", "digital literac", "youth", "capacity build",
-    "entrepreneurship", "job match", "workforce", "upskill", "reskill",
-    "edtech", "e-learning", "vocational", "labor market", "employment",
-    "skills development", "training", "human capital", "ai skill",
-]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,26 +200,7 @@ def source_from_url(url: str) -> str:
     return "Web"
 
 
-def search_tavily(query: str, depth: str = "advanced") -> list[dict]:
-    """Run a single Tavily search and return raw results."""
-    try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key":        TAVILY_API_KEY,
-                "query":          query,
-                "search_depth":   depth,
-                "max_results":    8,
-                "include_answer": False,
-            },
-            headers=HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json().get("results", [])
-    except Exception as e:
-        print(f"    [Tavily search error] {e}")
-        return []
+
 
 
 def tavily_extract(url: str) -> str:
@@ -439,18 +388,6 @@ def collect_all_results() -> list[dict]:
     # STEP 1: Direct portal crawl — most reliable, uses exact URLs you provided
     for n in crawl_portals():
         add_result(n["title"], n["url"], n.get("description",""), n.get("date",""), n.get("country",""))
-
-    # STEP 2: Supplementary web searches for anything the portals missed
-    print(f"  Running {len(SEARCH_QUERIES)} supplementary web searches…")
-    for i, query in enumerate(SEARCH_QUERIES, 1):
-        print(f"    [{i}/{len(SEARCH_QUERIES)}] {query[:80]}…")
-        for r in search_tavily(query):
-            add_result(
-                r.get("title", ""),
-                r.get("url", ""),
-                r.get("content") or r.get("snippet") or "",
-                r.get("published_date", ""),
-            )
 
     print(f"  Total unique results: {len(all_results)}")
     return all_results
@@ -713,7 +650,7 @@ def send_email(html_body: str, count: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("🔍 Searching for procurement notices via Tavily…")
+    print("🔍 Crawling procurement portals (AfDB, World Bank, EU)…")
     notices = collect_all_results()
 
     if not notices:
