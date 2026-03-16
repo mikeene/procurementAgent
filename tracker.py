@@ -37,19 +37,23 @@ HEADERS = {"Content-Type": "application/json"}
 # These use site: targeting so results only come from the exact portals.
 # Tavily searches Google's rendered index — bypasses JS rendering issues.
 
+# AfDB: restrict to the exact procurement sub-path so news/events are excluded
+# World Bank: restrict to /opportunities path
+# EU: use the exact URL you specified — the Funding & Tenders calls-for-tenders page
 PORTAL_QUERIES = [
-    # AfDB — procurement notices
-    ("AfDB",       'site:afdb.org/en/projects-and-operations/procurement RFP OR "request for proposal" OR "call for tender" OR "expression of interest" 2025'),
-    ("AfDB",       'site:afdb.org procurement "digital skills" OR "capacity building" OR "youth" OR "skills development" OR "entrepreneurship" 2025'),
-    ("AfDB",       'site:afdb.org procurement "job matching" OR "workforce" OR "vocational" OR "edtech" OR "AI training" 2025'),
-    # World Bank — opportunities
-    ("World Bank", 'site:projects.worldbank.org/en/projects-operations/opportunities "digital skills" OR "capacity building" OR "youth employment" 2025'),
-    ("World Bank", 'site:projects.worldbank.org/en/projects-operations/opportunities "skills development" OR "entrepreneurship" OR "workforce" OR "job matching" 2025'),
-    ("World Bank", 'site:projects.worldbank.org RFP OR "request for proposal" OR "expression of interest" "digital" OR "skills" OR "training" 2025'),
-    # EU Tenders Portal
-    ("EU",         'site:ec.europa.eu/info/funding-tenders "digital skills" OR "capacity building" OR "youth employment" OR "skills development" 2025'),
-    ("EU",         'site:ec.europa.eu/info/funding-tenders "entrepreneurship" OR "job matching" OR "workforce development" OR "vocational training" 2025'),
+    # AfDB — exact procurement path only
+    ("AfDB", 'site:afdb.org/en/projects-and-operations/procurement "digital skills" OR "capacity building" OR "youth" OR "skills development" 2025'),
+    ("AfDB", 'site:afdb.org/en/projects-and-operations/procurement "entrepreneurship" OR "job matching" OR "workforce" OR "vocational" OR "AI training" 2025'),
+    # World Bank — exact opportunities path only
+    ("World Bank", 'site:projects.worldbank.org/en/projects-operations/opportunities "digital skills" OR "capacity building" OR "youth employment" OR "skills development" 2025'),
+    ("World Bank", 'site:projects.worldbank.org/en/projects-operations/opportunities "entrepreneurship" OR "job matching" OR "workforce" OR "vocational training" OR "AI" 2025'),
+    # EU — exact portal you specified: ec.europa.eu Funding & Tenders calls-for-tenders
+    ("EU", 'site:ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/calls-for-tenders "digital skills" OR "capacity building" OR "youth employment" OR "skills development" 2025'),
+    ("EU", 'site:ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/calls-for-tenders "entrepreneurship" OR "job matching" OR "workforce development" OR "vocational training" OR "AI training" 2025'),
 ]
+
+# EU notice base URL — individual tender notices live at this path
+EU_NOTICE_BASE = "https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/calls-for-tenders"
 
 
 
@@ -273,9 +277,14 @@ def collect_all_results() -> list[dict]:
             return
         # Enforce correct domain per source
         url_lower = url.lower()
+        if source == "AfDB"       and "/en/projects-and-operations/procurement" not in url_lower and "afdb.org" not in url_lower: return
         if source == "AfDB"       and "afdb.org" not in url_lower:       return
+        # Block AfDB news/events pages — only allow the procurement path
+        if source == "AfDB"       and any(x in url_lower for x in ["/news-and-events", "/news-events", "/press-releases", "/blog"]): return
         if source == "World Bank" and "worldbank.org" not in url_lower:   return
-        if source == "EU"         and ("ec.europa.eu" not in url_lower and "europa.eu" not in url_lower): return
+        # Block World Bank pages that are not the opportunities listing
+        if source == "World Bank" and "/projects-operations/opportunities" not in url_lower and "/procurement" not in url_lower: return
+        if source == "EU"         and "ec.europa.eu/info/funding-tenders" not in url_lower: return
 
         uk = url_lower[:120]
         tk = title.lower()[:80]
@@ -340,13 +349,15 @@ STRICT INCLUSION RULES — include ONLY if ALL of these are true:
 4. There is NO evidence the deadline has already passed before {today_str}
 
 STRICT EXCLUSION RULES — ALWAYS exclude:
-- News articles, press releases, blog posts, opinion pieces
-- Project descriptions or programme summaries (not procurement notices)
-- LinkedIn posts, social media content, or third-party aggregator articles
-- Any notice where the year is 2024 or earlier (likely expired)
-- Job postings (we want procurement, not employment)
+- News articles, press releases, blog posts, opinion pieces — even if from AfDB or World Bank
+- Any URL containing /news, /events, /press-release, /blog, /story, /media
+- Project descriptions or programme summaries (those are not procurement notices)
+- EU pages that are NOT on the ec.europa.eu/info/funding-tenders portal or not a direct tender/call notice
+- Any notice where the year is 2024 or earlier (expired)
+- Job postings (we want procurement contracts, not employment)
 - Conference announcements or event invitations
-- Reports, studies, or research publications
+- Reports, studies, research publications, or evaluations
+- General programme pages that describe activities but have no RFP/tender attached
 
 DEADLINE CHECK:
 - If description mentions a specific closing date before {today_str} → status: "closed", EXCLUDE
