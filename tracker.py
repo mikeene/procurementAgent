@@ -33,29 +33,22 @@ HEADERS = {"Content-Type": "application/json"}
 # Search queries — targeted at the exact sources and topics you care about
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Direct portal URLs with pagination ───────────────────────────────────────
-# Each entry: (source_name, url_template, page_param, start_page, max_pages)
-# url_template uses {page} as placeholder for the page number
+# ── Per-source Tavily search queries ─────────────────────────────────────────
+# These use site: targeting so results only come from the exact portals.
+# Tavily searches Google's rendered index — bypasses JS rendering issues.
 
-PORTAL_CONFIGS = [
-    {
-        "source":     "AfDB",
-        "url":        "https://www.afdb.org/en/projects-and-operations/procurement?page={page}",
-        "start_page": 0,       # AfDB uses 0-based pages (?page=0, ?page=1 …)
-        "max_pages":  5,       # crawl up to 5 pages
-    },
-    {
-        "source":     "World Bank",
-        "url":        "https://projects.worldbank.org/en/projects-operations/opportunities?srce=both&page={page}",
-        "start_page": 1,       # World Bank uses 1-based pages
-        "max_pages":  5,
-    },
-    {
-        "source":     "EU",
-        "url":        "https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/calls-for-tenders?order=DESC&pageNumber={page}&pageSize=50&sortBy=startDate&isExactMatch=true",
-        "start_page": 1,       # EU uses 1-based pageNumber
-        "max_pages":  3,       # EU pages are large (50 results each)
-    },
+PORTAL_QUERIES = [
+    # AfDB — procurement notices
+    ("AfDB",       'site:afdb.org/en/projects-and-operations/procurement RFP OR "request for proposal" OR "call for tender" OR "expression of interest" 2025'),
+    ("AfDB",       'site:afdb.org procurement "digital skills" OR "capacity building" OR "youth" OR "skills development" OR "entrepreneurship" 2025'),
+    ("AfDB",       'site:afdb.org procurement "job matching" OR "workforce" OR "vocational" OR "edtech" OR "AI training" 2025'),
+    # World Bank — opportunities
+    ("World Bank", 'site:projects.worldbank.org/en/projects-operations/opportunities "digital skills" OR "capacity building" OR "youth employment" 2025'),
+    ("World Bank", 'site:projects.worldbank.org/en/projects-operations/opportunities "skills development" OR "entrepreneurship" OR "workforce" OR "job matching" 2025'),
+    ("World Bank", 'site:projects.worldbank.org RFP OR "request for proposal" OR "expression of interest" "digital" OR "skills" OR "training" 2025'),
+    # EU Tenders Portal
+    ("EU",         'site:ec.europa.eu/info/funding-tenders "digital skills" OR "capacity building" OR "youth employment" OR "skills development" 2025'),
+    ("EU",         'site:ec.europa.eu/info/funding-tenders "entrepreneurship" OR "job matching" OR "workforce development" OR "vocational training" 2025'),
 ]
 
 
@@ -203,8 +196,51 @@ def source_from_url(url: str) -> str:
 
 
 
+def tavily_search(query: str, source_hint: str) -> list[dict]:
+    """
+    Search Tavily with include_raw_content so we get full page text.
+    Uses site: targeting to restrict results to the correct portal.
+    This works even on JS-rendered pages because Tavily uses Google's index.
+    """
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key":             TAVILY_API_KEY,
+                "query":               query,
+                "search_depth":        "advanced",
+                "max_results":         10,
+                "include_raw_content": True,
+                "include_answer":      False,
+            },
+            headers=HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        notices = []
+        for r in results:
+            title = (r.get("title") or "").strip()
+            url   = (r.get("url") or "").strip()
+            # Use raw_content if available (much richer), else fall back to snippet
+            content = (r.get("raw_content") or r.get("content") or "").strip()
+            if title and url:
+                notices.append({
+                    "source":      source_hint,
+                    "title":       title,
+                    "url":         url,
+                    "description": content[:500],
+                    "date":        r.get("published_date", ""),
+                    "country":     "",
+                })
+        return notices
+    except Exception as e:
+        print(f"    [Tavily search error] {e}")
+        return []
+
+
 def tavily_extract(url: str) -> str:
-    """Extract full page content via Tavily — bypasses bot blocks."""
+    """Extract a specific page via Tavily Extract (used for deadline checking)."""
     try:
         resp = requests.post(
             "https://api.tavily.com/extract",
@@ -220,174 +256,49 @@ def tavily_extract(url: str) -> str:
         return ""
 
 
-def parse_notices_from_text(text: str, source: str, listing_url: str) -> list[dict]:
-    """
-    Parse a procurement listing page extracted as plain text.
-    Uses Groq to extract structured notice data from the raw text.
-    This is more reliable than regex for varied page layouts.
-    """
-    if not text or len(text) < 100:
-        return []
-
-    today_str = date.today().strftime("%Y-%m-%d")
-
-    try:
-        prompt = f"""You are parsing a procurement portal listing page for {source}.
-Today is {today_str}.
-
-The text below is the raw content of a procurement listing page.
-Extract all individual procurement notices/opportunities listed on this page.
-
-For each notice found, return:
-- "title": the notice title
-- "url": any direct link/URL to the notice (if visible in text), else use "{listing_url}"
-- "deadline": closing/deadline date if shown (YYYY-MM-DD format), else ""
-- "country": country if shown, else ""
-- "description": brief description if available, else ""
-
-ONLY include items that are actual procurement notices (RFP, RFQ, tender, call for proposals, EOI).
-ONLY include notices from 2025 or later — skip anything from 2024 or earlier.
-If deadline has already passed before {today_str}, skip it.
-
-Raw page text (first 6000 chars):
-{text[:6000]}
-
-Return ONLY a JSON array. No markdown, no explanation."""
-
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=3000,
-        )
-        raw = response.choices[0].message.content.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        items = json.loads(raw.strip())
-
-        notices = []
-        for item in items:
-            title = (item.get("title") or "").strip()
-            if not title or len(title) < 8:
-                continue
-            notices.append({
-                "source":      source,
-                "title":       title,
-                "url":         item.get("url") or listing_url,
-                "deadline":    item.get("deadline", ""),
-                "country":     item.get("country", ""),
-                "description": item.get("description", ""),
-                "date":        item.get("deadline", ""),
-            })
-        return notices
-
-    except Exception as e:
-        print(f"    [parse_notices error] {e}")
-        return []
-
-
-def crawl_portals() -> list[dict]:
-    """
-    Crawl procurement portals page by page using Tavily Extract.
-    Tavily fetches from their servers — bypasses all bot blocks.
-    Stops early if a page returns no new notices (end of listing reached).
-    """
-    all_notices = []
-    seen_titles = set()
-
-    for config in PORTAL_CONFIGS:
-        source    = config["source"]
-        url_tmpl  = config["url"]
-        start     = config["start_page"]
-        max_pages = config["max_pages"]
-
-        print(f"  Crawling {source} (up to {max_pages} pages)…")
-
-        for page_num in range(start, start + max_pages):
-            url = url_tmpl.replace("{page}", str(page_num))
-            print(f"    Page {page_num}: {url[:90]}…")
-
-            text = tavily_extract(url)
-            if not text:
-                print(f"    No content — stopping {source} pagination")
-                break
-
-            print(f"    Got {len(text)} chars — parsing…")
-            notices = parse_notices_from_text(text, source, url)
-            print(f"    Found {len(notices)} notices on page {page_num}")
-
-            new_on_page = 0
-            for n in notices:
-                key = n["title"].lower()[:80]
-                if key not in seen_titles:
-                    seen_titles.add(key)
-                    all_notices.append(n)
-                    new_on_page += 1
-
-            # Stop paginating if no new notices found on this page
-            if new_on_page == 0:
-                print(f"    No new notices on page {page_num} — stopping {source} pagination")
-                break
-
-    print(f"  Portal crawl total: {len(all_notices)} notices")
-    return all_notices
-
-
 def collect_all_results() -> list[dict]:
-    """Run all search queries + direct AfDB extraction, deduplicated."""
+    """
+    Search each portal using Tavily with site: targeting and include_raw_content.
+    This works on JS-rendered pages because Tavily uses Google's indexed content.
+    Only AfDB, World Bank, and EU Tenders portals are searched.
+    """
     all_results = []
     seen_urls   = set()
     seen_titles = set()
 
-    # Domains that are NOT procurement sources — block them
-    BLOCKED_DOMAINS = [
-        "linkedin.com", "twitter.com", "facebook.com", "instagram.com",
-        "youtube.com", "medium.com", "substack.com", "quora.com",
-        "reddit.com", "wikipedia.org", "slideshare.net", "scribd.com",
-        "researchgate.net", "academia.edu",
-    ]
+    today_str = date.today().strftime("%Y-%m-%d")
 
-    # Only accept results from known procurement/development domains
-    ALLOWED_DOMAINS = [
-        "afdb.org", "worldbank.org", "imf.org", "undp.org", "unicef.org",
-        "ted.europa.eu", "ec.europa.eu", "usaid.gov", "ungm.org",
-        "reliefweb.int", "devex.com", "adb.org", "iadb.org", "ebrd.com",
-        "globalfund.org", "giz.de", "dfid.gov.uk", "gov.uk", "europa.eu",
-        "un.org", "ilo.org", "ifc.org", "miga.org", "oecd.org",
-    ]
-
-    def add_result(title, url, description, date="", country=""):
+    def add(source, title, url, description, pub_date="", country=""):
+        if not title or len(title) < 6 or not url:
+            return
+        # Enforce correct domain per source
         url_lower = url.lower()
-        url_key   = url_lower[:120]
-        title_key = title.lower()[:80]
+        if source == "AfDB"       and "afdb.org" not in url_lower:       return
+        if source == "World Bank" and "worldbank.org" not in url_lower:   return
+        if source == "EU"         and ("ec.europa.eu" not in url_lower and "europa.eu" not in url_lower): return
 
-        if not title or len(title) < 6:
+        uk = url_lower[:120]
+        tk = title.lower()[:80]
+        if uk in seen_urls or tk in seen_titles:
             return
-        # Block social media and non-procurement sites
-        if any(d in url_lower for d in BLOCKED_DOMAINS):
-            return
-        # Only allow known procurement/development domains
-        if not any(d in url_lower for d in ALLOWED_DOMAINS):
-            return
-        if url_key in seen_urls or title_key in seen_titles:
-            return
-
-        seen_urls.add(url_key)
-        seen_titles.add(title_key)
+        seen_urls.add(uk)
+        seen_titles.add(tk)
         all_results.append({
-            "source":      source_from_url(url),
+            "source":      source,
             "title":       title,
-            "description": description[:400],
+            "description": description[:500],
             "url":         url,
-            "date":        date,
+            "date":        pub_date,
             "country":     country,
+            "deadline":    "",
+            "status":      "unknown",
         })
 
-    # STEP 1: Direct portal crawl — most reliable, uses exact URLs you provided
-    for n in crawl_portals():
-        add_result(n["title"], n["url"], n.get("description",""), n.get("date",""), n.get("country",""))
+    print(f"  Running {len(PORTAL_QUERIES)} targeted portal searches…")
+    for i, (source, query) in enumerate(PORTAL_QUERIES, 1):
+        print(f"    [{i}/{len(PORTAL_QUERIES)}] {source}: {query[:70]}…")
+        for r in tavily_search(query, source):
+            add(source, r["title"], r["url"], r["description"], r.get("date",""))
 
     print(f"  Total unique results: {len(all_results)}")
     return all_results
